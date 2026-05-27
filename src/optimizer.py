@@ -17,13 +17,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-import anthropic
-
+from src.backend import complete
 from src.runner import run_rollout, summarise, load_results
 
 # ─── config ───────────────────────────────────────────────────────────────────
@@ -151,7 +149,7 @@ Your task: propose ONE targeted edit to the skill that closes the most common fa
 
 Rules:
 - Edit Step 3 ("Inspect Each Changed Section") unless there is a compelling reason to edit elsewhere
-- Use the propose_edit tool — old_text must appear VERBATIM in the skill (copy it exactly)
+- old_text must appear VERBATIM in the skill (copy it character-for-character)
 - new_text should add specific, actionable guidance — concrete patterns, not vague advice
 - Prefer inserting 2-4 precise bullet examples over rewriting entire sections
 - Do NOT modify the <!-- SLOW_UPDATE_START --> ... <!-- SLOW_UPDATE_END --> block
@@ -161,70 +159,59 @@ Think step by step:
 1. Which category has the lowest catch rate?
 2. What specific pattern is the agent missing in reviews for that category?
 3. What one concrete addition to Step 3 would teach it to check for that pattern?
+
+Return a JSON object with these exact fields:
+  target_step  — which step you are editing (e.g. "Step 3")
+  rationale    — one sentence: why this edit improves the top failure mode
+  old_text     — the exact text to replace (verbatim from the skill)
+  new_text     — the replacement text
 """
 
-_PROPOSE_TOOL = {
-    "name": "propose_edit",
-    "description": "Propose a single targeted edit to the skill to improve bug detection.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "target_step": {
-                "type": "string",
-                "description": "Which step you are editing (e.g. 'Step 3')",
-            },
-            "rationale": {
-                "type": "string",
-                "description": "One sentence: why this edit will improve the top failure mode.",
-            },
-            "old_text": {
-                "type": "string",
-                "description": "The exact text to replace (must appear verbatim in the skill).",
-            },
-            "new_text": {
-                "type": "string",
-                "description": "The replacement text.",
-            },
-        },
-        "required": ["target_step", "rationale", "old_text", "new_text"],
+_PROPOSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "target_step": {"type": "string"},
+        "rationale":   {"type": "string"},
+        "old_text":    {"type": "string"},
+        "new_text":    {"type": "string"},
     },
+    "required": ["target_step", "rationale", "old_text", "new_text"],
 }
 
 
 def propose_edit(
-    client: anthropic.Anthropic,
     skill_text: str,
     summary: dict,
     results: list[dict],
     epoch: int,
 ) -> EditProposal | None:
-    """Ask Sonnet to propose a targeted patch. Returns None if the model declines."""
+    """Ask Sonnet to propose a targeted patch. Returns None on parse failure."""
     analysis = build_failure_analysis(summary, results)
     user_msg = (
         f"Current skill:\n\n<skill>\n{skill_text}\n</skill>\n\n"
         f"{analysis}"
     )
 
-    response = client.messages.create(
-        model=OPTIMIZER_MODEL,
-        max_tokens=2048,
+    call = complete(
         system=_PROPOSE_SYSTEM,
-        tools=[_PROPOSE_TOOL],
-        tool_choice={"type": "any"},
-        messages=[{"role": "user", "content": user_msg}],
+        user=user_msg,
+        model=OPTIMIZER_MODEL,
+        json_schema=_PROPOSE_SCHEMA,
+        timeout=180,
     )
 
-    for block in response.content:
-        if block.type == "tool_use" and block.name == "propose_edit":
-            inp = block.input
-            return EditProposal(
-                epoch=epoch,
-                target_step=inp["target_step"],
-                rationale=inp["rationale"],
-                old_text=inp["old_text"],
-                new_text=inp["new_text"],
-            )
-    return None
+    if not call.structured:
+        print(f"   propose_edit: no structured output — raw: {call.text[:200]!r}")
+        return None
+
+    d = call.structured
+    return EditProposal(
+        epoch=epoch,
+        target_step=d.get("target_step", ""),
+        rationale=d.get("rationale", ""),
+        old_text=d.get("old_text", ""),
+        new_text=d.get("new_text", ""),
+    )
 
 
 # ─── apply edit ───────────────────────────────────────────────────────────────
@@ -257,7 +244,6 @@ Rules:
 
 
 def slow_update(
-    client: anthropic.Anthropic,
     skill_path: Path,
     epoch_summaries: list[dict],
 ) -> None:
@@ -287,14 +273,14 @@ def slow_update(
         f"Epoch summaries:\n" + "\n".join(epoch_lines)
     )
 
-    response = client.messages.create(
-        model=OPTIMIZER_MODEL,
-        max_tokens=512,
+    call = complete(
         system=_SLOW_UPDATE_SYSTEM,
-        messages=[{"role": "user", "content": user_msg}],
+        user=user_msg,
+        model=OPTIMIZER_MODEL,
+        timeout=120,
     )
 
-    new_content = response.content[0].text.strip()
+    new_content = call.text.strip()
     replacement = (
         f"<!-- SLOW_UPDATE_START -->\n"
         f"{new_content}\n"
@@ -307,7 +293,6 @@ def slow_update(
 # ─── single epoch ─────────────────────────────────────────────────────────────
 
 def run_epoch(
-    client: anthropic.Anthropic,
     epoch: int,
     prev_selection_score: float,
     epoch_dir: Path,
@@ -333,7 +318,7 @@ def run_epoch(
 
     # ── 2. propose edit ───────────────────────────────────────────────────────
     print(f"\n── Propose edit {'─' * 40}")
-    proposal = propose_edit(client, skill_text, train_summary, train_results, epoch)
+    proposal = propose_edit(skill_text, train_summary, train_results, epoch)
 
     if proposal is None:
         print("   Model declined to propose an edit.")
@@ -423,7 +408,6 @@ def run_optimizer(
     dry_run: bool = False,
     start_epoch: int = 1,
 ) -> None:
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
     EPOCHS_DIR.mkdir(parents=True, exist_ok=True)
 
     # ── baseline selection score ───────────────────────────────────────────────
@@ -457,7 +441,7 @@ def run_optimizer(
     for epoch in range(start_epoch, start_epoch + n_epochs):
         epoch_dir = EPOCHS_DIR / f"epoch_{epoch:03d}"
 
-        result = run_epoch(client, epoch, prev_score, epoch_dir, dry_run=dry_run)
+        result = run_epoch(epoch, prev_score, epoch_dir, dry_run=dry_run)
         epoch_results.append(result)
 
         if result.accepted:
@@ -471,7 +455,7 @@ def run_optimizer(
         # slow update (always runs, regardless of gate outcome)
         if not dry_run and epoch_summaries:
             print(f"\n── Slow update {'─' * 42}")
-            slow_update(client, SKILL_PATH, epoch_summaries)
+            slow_update(SKILL_PATH, epoch_summaries)
 
     # ── final report ──────────────────────────────────────────────────────────
     print("\n══ Optimizer complete ════════════════════════════════════════════")

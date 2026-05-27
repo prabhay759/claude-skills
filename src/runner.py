@@ -6,8 +6,8 @@ Usage:
   python -m src.runner --split selection
   python -m src.runner --split train --model claude-haiku-4-5-20251001 --output data/run_001.jsonl
 
-The system prompt (skill.md) is sent with cache_control so the full-text is
-only billed once per rollout; subsequent tasks reuse the cached prefix.
+Uses the `claude` CLI via the OAuth session — no ANTHROPIC_API_KEY needed.
+The CLI reuses its own prompt cache across calls in the same process run.
 
 Output is JSONL — one result per line — so interrupted runs are resumable:
 pass --output to an existing file and already-processed task IDs are skipped.
@@ -17,20 +17,18 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
-import anthropic
-
-from src.scorer import score_review, aggregate
+from src.backend import complete
+from src.scorer import score_review
 
 # ─── constants ────────────────────────────────────────────────────────────────
 
 DEFAULT_MODEL  = "claude-haiku-4-5-20251001"
-MAX_TOKENS     = 1024
 DATA_DIR       = Path(__file__).parent.parent / "data"
 SKILL_PATH     = Path(__file__).parent.parent / "skill.md"
 
@@ -56,37 +54,20 @@ def _load_skill(path: Path) -> str:
 
 # ─── single-task rollout ──────────────────────────────────────────────────────
 
-def run_task(
-    client: anthropic.Anthropic,
-    task: dict,
-    skill_text: str,
-    model: str,
-) -> dict:
-    """Call the API for one task and return a scored result dict."""
+def run_task(task: dict, skill_text: str, model: str) -> dict:
+    """Call the claude CLI for one task and return a scored result dict."""
     start = time.monotonic()
 
-    response = client.messages.create(
+    call = complete(
+        system=skill_text,
+        user=_build_user_message(task),
         model=model,
-        max_tokens=MAX_TOKENS,
-        system=[
-            {
-                "type": "text",
-                "text": skill_text,
-                # cache the skill — same for every task in a rollout
-                "cache_control": {"type": "ephemeral"},
-            }
-        ],
-        messages=[
-            {"role": "user", "content": _build_user_message(task)},
-        ],
     )
 
     elapsed = time.monotonic() - start
-    review  = response.content[0].text
-
+    review  = call.text
     result  = score_review(review, task)
 
-    usage = response.usage
     return {
         "task_id":   task["id"],
         "scenario":  task["scenario"],
@@ -102,12 +83,8 @@ def run_task(
         "review":    review,
         "model":     model,
         "elapsed_s": round(elapsed, 2),
-        "usage": {
-            "input_tokens":              usage.input_tokens,
-            "output_tokens":             usage.output_tokens,
-            "cache_creation_input_tokens": getattr(usage, "cache_creation_input_tokens", 0),
-            "cache_read_input_tokens":     getattr(usage, "cache_read_input_tokens", 0),
-        },
+        "usage":     call.usage,
+        "cost_usd":  round(call.cost_usd, 6),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -122,14 +99,17 @@ def run_rollout(
     tasks_path: Path = DATA_DIR / "tasks.json",
     skill_path: Path = SKILL_PATH,
     verbose: bool = True,
+    workers: int = 8,
 ) -> list[dict]:
     """
     Run the agent on every task in `split` (optionally capped at `limit`).
 
+    Uses a thread pool so multiple claude CLI subprocesses run in parallel,
+    cutting wall-clock time from (n_tasks × ~50s) to (n_tasks/workers × ~50s).
+
     Returns the list of result dicts. Also writes to `output_path` as JSONL
     if provided, skipping tasks whose IDs are already in the file.
     """
-    client     = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
     skill_text = _load_skill(skill_path)
     all_tasks  = json.loads(tasks_path.read_text())
 
@@ -147,33 +127,52 @@ def run_rollout(
             print(f"Resuming — {len(done_ids)} tasks already done, skipping.")
 
     pending = [t for t in tasks if t["id"] not in done_ids]
+    if not pending:
+        return []
+
+    if verbose:
+        print(f"Running {len(pending)} tasks ({workers} workers)…")
 
     results: list[dict] = []
     scores:  list[float] = []
+    completed = 0
 
-    for i, task in enumerate(pending):
-        try:
-            result = run_task(client, task, skill_text, model)
-        except anthropic.APIError as exc:
-            print(f"  API error on {task['id']}: {exc}", file=sys.stderr)
-            continue
+    # write lock so parallel threads don't interleave JSONL lines
+    import threading
+    write_lock = threading.Lock()
 
-        results.append(result)
-        scores.append(result["score"])
+    def _run(task: dict) -> dict:
+        return run_task(task, skill_text, model)
 
-        if output_path:
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            with output_path.open("a") as f:
-                f.write(json.dumps(result) + "\n")
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_run, task): task for task in pending}
+        for future in as_completed(futures):
+            task = futures[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                print(f"  Error on {task['id']}: {exc}", file=sys.stderr)
+                continue
 
-        if verbose:
-            mean = sum(scores) / len(scores)
-            cache_read = result["usage"]["cache_read_input_tokens"]
-            print(
-                f"[{i+1:>3}/{len(pending)}] {task['id']} | {task['scenario']:<18} "
-                f"score={result['score']:.2f}  mean={mean:.2f}  "
-                f"cache_read={cache_read:>5}  {result['elapsed_s']:.1f}s"
-            )
+            with write_lock:
+                completed += 1
+                results.append(result)
+                scores.append(result["score"])
+
+                if output_path:
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    with output_path.open("a") as f:
+                        f.write(json.dumps(result) + "\n")
+
+                if verbose:
+                    mean = sum(scores) / len(scores)
+                    cache_read = result["usage"]["cache_read_input_tokens"]
+                    print(
+                        f"[{completed:>3}/{len(pending)}] {result['task_id']} "
+                        f"| {result['scenario']:<18} "
+                        f"score={result['score']:.2f}  mean={mean:.2f}  "
+                        f"cache_read={cache_read:>5}  {result['elapsed_s']:.1f}s"
+                    )
 
     return results
 
@@ -226,6 +225,7 @@ def summarise(results: list[dict]) -> dict:
         "total_input_tokens":  sum(r["usage"]["input_tokens"]  for r in results),
         "total_output_tokens": sum(r["usage"]["output_tokens"] for r in results),
         "total_cache_reads":   sum(r["usage"]["cache_read_input_tokens"] for r in results),
+        "total_cost_usd":      round(sum(r.get("cost_usd", 0.0) for r in results), 4),
     }
 
 
