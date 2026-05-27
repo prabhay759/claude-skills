@@ -69,6 +69,4 @@ user.role on the next line will throw TypeError. Add a null guard.
 ---
 
 <!-- SLOW_UPDATE_START -->
-<!-- Reserved for epoch-level strategic guidance written by the optimizer. -->
-<!-- Do not edit this block manually. -->
 <!-- SLOW_UPDATE_END -->

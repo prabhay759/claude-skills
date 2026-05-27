@@ -72,6 +72,12 @@ def complete(
 
     # result field holds the text response otherwise
     text = envelope.get("result", "")
+
+    # session / rate limits surface as plain text in the result field, not as
+    # an error exit code — detect and raise so callers don't silently score 0.00
+    _LIMIT_PHRASES = ("session limit", "rate limit", "resets at", "resets ")
+    if any(p in text.lower() for p in _LIMIT_PHRASES):
+        raise RuntimeError(f"Claude session limit: {text.strip()[:120]}")
     if structured and not text:
         text = json.dumps(structured)
 
