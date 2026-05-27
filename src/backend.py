@@ -9,6 +9,7 @@ result text, and usage stats (including cache hit counts) for free.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from dataclasses import dataclass
 
@@ -52,12 +53,17 @@ def complete(
     if json_schema:
         cmd += ["--json-schema", json.dumps(json_schema)]
 
+    # CLAUDE_OPTIMIZER_SUBPROCESS=1 signals the stop hook to skip git checks
+    # so it doesn't inject "untracked files" messages as a new Claude turn.
+    env = {**os.environ, "CLAUDE_OPTIMIZER_SUBPROCESS": "1"}
+
     proc = subprocess.run(
         cmd,
         input=user,
         capture_output=True,
         text=True,
         timeout=timeout,
+        env=env,
     )
 
     if proc.returncode != 0 and not proc.stdout.strip():
@@ -78,6 +84,13 @@ def complete(
     _LIMIT_PHRASES = ("session limit", "rate limit", "resets at", "resets ")
     if any(p in text.lower() for p in _LIMIT_PHRASES):
         raise RuntimeError(f"Claude session limit: {text.strip()[:120]}")
+
+    # stop-hook injection: the hook responds as a conversational assistant instead
+    # of producing a review — detect by the hook's characteristic phrasing.
+    _HOOK_PHRASES = ("stop hook alert", "untracked files in the repository",
+                     "uncommitted changes in the repository", "unpushed commit")
+    if any(p in text.lower() for p in _HOOK_PHRASES):
+        raise RuntimeError(f"Stop hook corrupted response: {text.strip()[:120]}")
     if structured and not text:
         text = json.dumps(structured)
 
