@@ -72,13 +72,4 @@ user.role on the next line will throw TypeError. Add a null guard.
 ---
 
 <!-- SLOW_UPDATE_START -->
-- **Cache key collisions are the #1 logic miss**: whenever a key is constructed from fewer fields than uniquely identify the resource (e.g., using only `userId` in a store shared across resource types, or omitting `tenantId` in a multi-tenant context), flag it — always verify every dimension of uniqueness is encoded in the key.
-
-- **Verify expiry units and magnitudes on every TTL/timeout value**: wrong_expiry errors follow two patterns — (1) passing seconds to an API that expects milliseconds (or vice versa), and (2) a duration that is semantically wrong for the use case (session token expiring in 5 s, lock held for 24 h). Sanity-check both the unit and the reasonableness of the value.
-
-- **Check for cache stampede on any "miss → recompute" path**: if a cache miss triggers an expensive operation (DB query, external call, heavy compute) without a lock, single-flight guard, or probabilistic early expiry, concurrent requests will all miss simultaneously and flood the backend — flag any cold-start or high-traffic path that lacks this protection.
-
-- **Hunt for swallowed errors — empty or logging-only catch blocks that discard the exception**: look for `catch {}`, `.catch(() => {})`, `except: pass`, or catches that log but still `return null`/`return undefined` — these hide failures silently; verify that every error path either re-throws, propagates a typed error, or surfaces the failure to the caller in a structured way.
-
-- **Logic is the weakest category (71% catch rate) — always trace branches with concrete boundary values**: for conditionals involving comparisons, off-by-one indices, combined boolean expressions, or state-machine transitions, mentally substitute edge-case values (0, -1, empty string, max int, equal bounds) rather than reading the logic abstractly.
 <!-- SLOW_UPDATE_END -->

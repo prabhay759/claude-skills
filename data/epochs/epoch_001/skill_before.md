@@ -25,9 +25,6 @@ Go back through the diff and check each section for issues. Look for:
 
 - **Security**: hardcoded secrets, injection, missing authentication, unvalidated input
 - **Logic**: wrong conditions, off-by-one errors, missing state updates
-  - **Cache key collisions**: keys that are bare IDs with no entity-type prefix — e.g. `cacheGet('42')` used for both users and products hits the same slot; keys must encode the entity type (`user:42`, `product:42`)
-  - **Unused TTL / wrong expiry**: a `ttlSeconds` (or similar) parameter accepted by the function but never forwarded to the underlying store call (e.g. `SET key value` with no `EX` argument), so entries never expire
-  - **Cache stampede**: on a cache miss, multiple concurrent callers all recompute and overwrite — look for a missing lock/mutex guard around the miss-fill path
 - **Null safety**: unchecked return values, missing guards before property access
 - **Error handling**: swallowed exceptions, missing rollbacks, silent failures
 - **Performance**: N+1 queries, missing cache expiry, unnecessary loops
@@ -72,13 +69,4 @@ user.role on the next line will throw TypeError. Add a null guard.
 ---
 
 <!-- SLOW_UPDATE_START -->
-- **Cache key collisions are the #1 logic miss**: whenever a key is constructed from fewer fields than uniquely identify the resource (e.g., using only `userId` in a store shared across resource types, or omitting `tenantId` in a multi-tenant context), flag it — always verify every dimension of uniqueness is encoded in the key.
-
-- **Verify expiry units and magnitudes on every TTL/timeout value**: wrong_expiry errors follow two patterns — (1) passing seconds to an API that expects milliseconds (or vice versa), and (2) a duration that is semantically wrong for the use case (session token expiring in 5 s, lock held for 24 h). Sanity-check both the unit and the reasonableness of the value.
-
-- **Check for cache stampede on any "miss → recompute" path**: if a cache miss triggers an expensive operation (DB query, external call, heavy compute) without a lock, single-flight guard, or probabilistic early expiry, concurrent requests will all miss simultaneously and flood the backend — flag any cold-start or high-traffic path that lacks this protection.
-
-- **Hunt for swallowed errors — empty or logging-only catch blocks that discard the exception**: look for `catch {}`, `.catch(() => {})`, `except: pass`, or catches that log but still `return null`/`return undefined` — these hide failures silently; verify that every error path either re-throws, propagates a typed error, or surfaces the failure to the caller in a structured way.
-
-- **Logic is the weakest category (71% catch rate) — always trace branches with concrete boundary values**: for conditionals involving comparisons, off-by-one indices, combined boolean expressions, or state-machine transitions, mentally substitute edge-case values (0, -1, empty string, max int, equal bounds) rather than reading the logic abstractly.
 <!-- SLOW_UPDATE_END -->
