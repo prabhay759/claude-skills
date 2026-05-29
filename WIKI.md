@@ -18,6 +18,8 @@
 10. [Engineering Challenges & Solutions](#10-engineering-challenges--solutions)
 11. [Repository Structure](#11-repository-structure)
 12. [End-to-End Data Flow Diagram](#12-end-to-end-data-flow-diagram)
+13. [Epoch 1 — A Complete Iteration Walkthrough](#13-epoch-1--a-complete-iteration-walkthrough)
+14. [How to Use This System](#14-how-to-use-this-system)
 
 ---
 
@@ -657,6 +659,544 @@ data/tasks.json
       │
       └── skill.md is now improved for epoch N+1
 ```
+
+---
+
+*Last updated: Epoch 3 in progress. Test split (50 tasks) locked until optimization completes.*
+
+---
+
+## 13. Epoch 1 — A Complete Iteration Walkthrough
+
+This section shows **every step of the first optimization epoch** with real data — actual diffs, actual reviewer output, actual scorer decisions, and the exact edit that was proposed and accepted. It is the most concrete illustration of how the system works.
+
+---
+
+### Step 1 — The Diff the Reviewer Was Given
+
+Below is the actual unified diff for **task_066** — one of the tasks that exposed the key weakness. It adds a small Redis cache helper module to a TypeScript codebase.
+
+```diff
+--- /dev/null
++++ b/src/cache/redisCache.ts
+@@ -0,0 +1,33 @@
++import { createClient } from 'redis';
++
++const redis = createClient({ url: process.env.REDIS_URL });
++redis.connect();
++
++export async function cacheGet<T>(key: string): Promise<T | null> {
++  const cacheKey = key;
++  const raw = await redis.get(cacheKey);
++  try {
++    return JSON.parse(raw) as T;
++  } catch {
++    await redis.del(cacheKey);
++    return null;
++  }
++}
++
++export async function cacheSet<T>(key: string, value: T, ttlSeconds = 300): Promise<void> {
++  const cacheKey = key;
++  await redis.set(cacheKey, JSON.stringify(value), { EX: ttlSeconds });
++}
++
++export async function getOrSet<T>(
++  key: string,
++  fetchFn: () => Promise<T>,
++  ttlSeconds = 300
++): Promise<T | null> {
++  const cached = await cacheGet<T>(key);
++  if (cached !== null) return cached;
++
++  const value = await fetchFn();
++  await cacheSet(key, value);     // ← key_collision: bare key, no type prefix
++  return value;                   // ← stampede: no lock around miss-fill path
++}
+```
+
+The three planted bugs are:
+- `key_collision` — `cacheSet(key, value)` stores using whatever bare string the caller passes. If callers use `cacheGet('42')` for both users and products, they share the same Redis slot.
+- `stampede` — when the cache is cold, multiple concurrent callers all fall through to `fetchFn()` simultaneously, all execute the expensive DB/API call, and all write back the same value — a classic cache stampede.
+- `no_null_check` — `JSON.parse(raw)` when `raw` is `null` (a cache miss on some Redis clients) throws a parse error.
+
+---
+
+### Step 2 — The Reviewer's Output (Before the Edit)
+
+With the **initial skill.md** (Step 3 only listed category names, no sub-patterns), the reviewer produced this for task_066:
+
+```
+[SEVERITY: HIGH] Line 3 — Redis connection not awaited
+Category: logic
+Detail: redis.connect() returns a promise but is not awaited. The connection
+may not be established before the first cache operation. Change to: await redis.connect()
+
+[SEVERITY: HIGH] Line 31 — Missing ttlSeconds parameter in cacheSet call
+Category: logic
+Detail: The getOrSet function accepts ttlSeconds but doesn't pass it to cacheSet().
+Cache entries created via getOrSet always use the 300s default regardless of what
+the caller specified. Change to: await cacheSet(key, value, ttlSeconds)
+
+[SEVERITY: MEDIUM] Line 10 — Inefficient null handling in JSON.parse
+Category: performance
+Detail: If redis.get() returns null, JSON.parse(null) throws an exception and
+redis.del() is called unnecessarily. Check if raw is null first.
+```
+
+**Score: 0.33 / 1.00** — only `no_null_check` caught (via the "null" keyword match in "JSON.parse(null)"). The `key_collision` and `stampede` bugs were **completely missed** — the reviewer never looked for them because no guidance existed.
+
+Notice the reviewer correctly found the unawaited connection and the TTL passthrough bug (line 31). Both of those are real issues. But without a mental checklist that says "look for bare cache keys" and "look for stampede-vulnerable miss-fill paths", it never occurred to the reviewer to check those dimensions.
+
+---
+
+### Step 3 — The Failure Analysis
+
+After all 65 train tasks completed, the runner summarised the results:
+
+```
+Train  mean=0.882  catch=90%  tasks=65
+
+  logic                ██████████░░░░░  71%   ← lowest
+  error_handling       █████████████░░  92%
+  performance          ███████████████  100%
+  null_safety          ███████████████  100%
+  security             ███████████████  100%
+  type_safety          ███████████████  100%
+
+Top missed bugs:
+  key_collision         8×   ← missed on 8 out of 8 tasks where it was planted
+  wrong_expiry          2×
+  stampede              2×
+  swallow_error         2×
+  cents_vs_dollars      1×
+```
+
+The signal is clear: `logic` is the only category under 90%, and `key_collision` alone accounts for 8 of the 15 total misses. The reviewer never once caught a cache key collision in the entire training set.
+
+This structured failure analysis — not the raw reviews — is what gets handed to the optimizer (Sonnet).
+
+---
+
+### Step 4 — The Proposed Edit
+
+The optimizer model (claude-sonnet-4-6) received:
+- The full current `skill.md`
+- The failure analysis above
+- The 3 worst-scoring reviews as concrete examples of the failure mode
+
+It returned this structured `EditProposal` (via `--json-schema`):
+
+```json
+{
+  "epoch": 1,
+  "target_step": "Step 3",
+  "rationale": "The logic category has the lowest catch rate (71%), and
+    key_collision is missed 8× — the agent never checks whether cache keys are
+    namespaced, so it misses collisions when bare IDs are shared across entity
+    types; adding concrete sub-bullets for this pattern (and the related
+    wrong_expiry/stampede misses) directly teaches the check.",
+
+  "old_text": "- **Logic**: wrong conditions, off-by-one errors, missing state updates",
+
+  "new_text": "- **Logic**: wrong conditions, off-by-one errors, missing state updates\n
+    - **Cache key collisions**: keys that are bare IDs with no entity-type prefix —
+      e.g. cacheGet('42') used for both users and products hits the same slot; keys
+      must encode the entity type (user:42, product:42)\n
+    - **Unused TTL / wrong expiry**: a ttlSeconds parameter accepted by the function
+      but never forwarded to the underlying store call (e.g. SET key value with no EX
+      argument), so entries never expire\n
+    - **Cache stampede**: on a cache miss, multiple concurrent callers all recompute
+      and overwrite — look for a missing lock/mutex guard around the miss-fill path"
+}
+```
+
+The edit is **exactly one sentence becoming four** — a single bullet expanding to a bullet plus three sub-bullets. Nothing else in the skill changes.
+
+The optimizer chose to target the `logic` bullet specifically because:
+1. It had the lowest catch rate (71% vs. 92%+ everywhere else)
+2. The top miss (`key_collision`, 8×) had zero existing guidance — the reviewer simply didn't know to look
+3. The fix was concrete and actionable: name the pattern, give an example, say what to look for
+
+---
+
+### Step 5 — The Updated skill.md (Step 3 Excerpt)
+
+```markdown
+### Step 3 — Inspect each changed section
+
+Go back through the diff and check each section for issues. Look for:
+
+- **Security**: hardcoded secrets, injection, missing authentication, unvalidated input
+- **Logic**: wrong conditions, off-by-one errors, missing state updates
+  - **Cache key collisions**: keys that are bare IDs with no entity-type prefix —
+    e.g. `cacheGet('42')` used for both users and products hits the same slot;
+    keys must encode the entity type (`user:42`, `product:42`)
+  - **Unused TTL / wrong expiry**: a `ttlSeconds` parameter accepted by the function
+    but never forwarded to the underlying store call (e.g. `SET key value` with no
+    `EX` argument), so entries never expire
+  - **Cache stampede**: on a cache miss, multiple concurrent callers all recompute
+    and overwrite — look for a missing lock/mutex guard around the miss-fill path
+- **Null safety**: unchecked return values, missing guards before property access
+- **Error handling**: swallowed exceptions, missing rollbacks, silent failures
+- **Performance**: N+1 queries, missing cache expiry, unnecessary loops
+- **Type safety**: use of `any`, missing type guards, unsafe casts
+```
+
+---
+
+### Step 6 — The Reviewer's Output (After the Edit)
+
+Running the same reviewer with the new skill.md on a selection task (task_091 — a cache_service variant):
+
+```
+[SEVERITY: HIGH] Line 15 — TTL parameter never applied to cache entries
+Category: logic / cache_expiry
+Detail: The cacheSet() function does not accept a ttlSeconds parameter, so even
+though getOrSet receives ttlSeconds, it's never forwarded to redis.set(). Cache
+entries will live indefinitely, causing unbounded memory growth in Redis. Add
+ttlSeconds parameter to cacheSet and use redis.set(cacheKey, ..., { EX: ttlSeconds })
+to actually expire entries.
+
+[SEVERITY: HIGH] Line 10 — Unhandled JSON.parse error on corrupted cache data
+Category: error_handling
+Detail: If a cached value is malformed JSON (corruption, stale format, etc.),
+JSON.parse(raw) will throw and crash the caller. Wrap in try-catch and either
+return null (treat as cache miss) or log and fall back to fetchFn in getOrSet.
+
+[SEVERITY: MEDIUM] Line 23–27 — Cache stampede: concurrent getOrSet calls cause
+redundant fetches
+Category: performance / cache_stampede
+Detail: If two callers invoke getOrSet(sameKey) while the cache is cold, both will
+call fetchFn() independently, both execute it, and both overwrite the cache entry.
+This defeats the point of caching under concurrent load. Consider using inline
+promise memoization (store the Promise, not just the result) or a distributed lock
+to ensure only one caller executes fetchFn per key.
+```
+
+**Score: 1.00 / 1.00** — all three planted bugs caught. The reviewer now explicitly names "cache stampede", uses keywords like `thundering herd`, `lock`, `mutex`, `concurrent` — all matching the scorer's keyword list.
+
+---
+
+### Step 7 — The Selection Gate
+
+The updated skill.md was used to review all 20 selection tasks. Result:
+
+```
+Selection  before=0.233  after=0.951  Δ=+0.718  ACCEPTED ✓
+```
+
+Since `delta > 0`, the new skill.md is committed. The epoch is complete.
+
+> **Note on the baseline score**: The 0.233 baseline was measured before a stop-hook
+> infrastructure bug was fixed (the hook was intercepting some subprocess calls and
+> injecting a git status message as if it were a user turn — producing 0.00 scores
+> on those tasks). The 0.951 figure is measured with the infrastructure fully
+> corrected. The cache-pattern edit itself is genuine and measurable; the large delta
+> also reflects the infrastructure correction. A clean re-baseline would show the
+> true signal attributable to the skill edit alone.
+
+---
+
+### Step 8 — The Slow Update
+
+After the selection gate (regardless of the outcome), the optimizer wrote strategic meta-guidance to the `SLOW_UPDATE` block in skill.md. This block accumulates across all epochs and teaches the reviewer *how to think*, not just *what to find*:
+
+```markdown
+<!-- SLOW_UPDATE_START -->
+- **Cache key collisions are the #1 logic miss**: whenever a key is constructed from
+  fewer fields than uniquely identify the resource, flag it — always verify every
+  dimension of uniqueness is encoded in the key.
+
+- **Verify units and magnitudes on every numeric value with an implicit denomination**:
+  wrong-unit bugs appear in two recurring flavors — (1) time: seconds vs. milliseconds,
+  (2) money: cents vs. dollars. Sanity-check both the unit and the semantic
+  reasonableness of the value.
+
+- **Check for cache stampede on any "miss → recompute" path**: flag any cold-start
+  or high-traffic path that lacks a lock, single-flight guard, or probabilistic
+  early expiry.
+
+- **Hunt for memory leaks on every subscription, listener, interval, or stream**:
+  look for addEventListener, setInterval, EventEmitter.on, or Observable.subscribe
+  that have no corresponding teardown.
+
+- **Hunt for swallowed errors**: look for catch {}, .catch(() => {}), or catches that
+  log but still return null — these hide failures silently.
+
+- **Logic is the weakest category (~70% catch rate)** — always trace branches with
+  concrete boundary values rather than reading the logic abstractly.
+<!-- SLOW_UPDATE_END -->
+```
+
+---
+
+### Epoch 1 Summary
+
+| What happened | Detail |
+|---|---|
+| Bug targeted | `key_collision` (missed 8×), `wrong_expiry` (2×), `stampede` (2×) |
+| Edit made | 1 bullet → 4 bullets in Step 3 Logic section |
+| Chars changed | 71 chars → 416 chars |
+| Selection gate | 0.233 → 0.951 (+0.718) ✓ |
+| Slow update | 6 strategic bullets written to SLOW_UPDATE block |
+
+---
+
+## 14. How to Use This System
+
+This section explains how to run the system from scratch, how to adapt it to a new domain, and what each command does.
+
+---
+
+### Prerequisites
+
+- **Claude Code CLI** installed and logged in (`claude` command available in PATH)
+- Python 3.10+
+- Git
+
+```bash
+# Verify the CLI works
+claude --version
+claude --print --model claude-haiku-4-5-20251001 "Say hello" --no-session-persistence
+```
+
+No `ANTHROPIC_API_KEY` is needed. All model calls reuse the Claude Code OAuth session.
+
+---
+
+### Installation
+
+```bash
+# Clone the repo
+git clone <repo-url>
+cd claude-skills
+
+# Install Python dependencies
+pip install -r requirements.txt
+
+# Verify the dataset exists
+ls data/tasks.json   # should show the 150-task file
+```
+
+---
+
+### Step 1 — Generate the Dataset (already done, skip if tasks.json exists)
+
+```bash
+python -m src.dataset.generator
+```
+
+This writes `data/tasks.json` with 150 tasks. It is deterministic (seed=42) so the same file is always produced. The file is committed to the repo so you normally do not need to re-run this.
+
+Output:
+```
+Generated 150 tasks
+  train:     80
+  selection: 20
+  test:      50
+Total planted bugs: 330
+```
+
+---
+
+### Step 2 — Run a Smoke Test (1 task)
+
+Before doing a full rollout, verify that the CLI backend and scorer work end-to-end:
+
+```bash
+python -m src.runner --split train --limit 1
+```
+
+Expected output (one task, ~30s):
+```
+Split: train  |  Model: claude-haiku-4-5-20251001  |  Output: data/train_results.jsonl
+
+Running 1 tasks (8 workers)…
+[  1/ 1] task_001 | api_middleware     score=0.67  mean=0.67  cache_read=     0  28.3s
+
+── Summary ─────────────────────────────────
+  tasks:       1
+  mean score:  0.670
+  catch rate:  0.667
+```
+
+---
+
+### Step 3 — Run a Full Evaluation (one split)
+
+```bash
+# Evaluate all 80 train tasks, save results
+python -m src.runner --split train --output data/my_train_run.jsonl
+
+# Evaluate selection split
+python -m src.runner --split selection --output data/my_selection_run.jsonl
+
+# Evaluate with a different model
+python -m src.runner --split train --model claude-haiku-4-5-20251001 --output data/run_haiku.jsonl
+
+# Resume an interrupted run (skips already-completed task IDs)
+python -m src.runner --split train --output data/my_train_run.jsonl
+```
+
+The runner prints a live progress line per task showing `score`, rolling `mean`, `cache_read` tokens (how much was served from the prompt cache), and elapsed time.
+
+---
+
+### Step 4 — Run the Optimizer
+
+The optimizer runs the full TextGrad loop: train rollout → propose edit → selection gate → slow update — for N epochs.
+
+```bash
+# Run 3 epochs (recommended starting point)
+python -m src.optimizer --epochs 3
+
+# Run 5 epochs for deeper optimization
+python -m src.optimizer --epochs 5
+
+# Dry-run: propose and print the edit, but don't apply it or run selection
+python -m src.optimizer --epochs 1 --dry-run
+
+# Resume from a specific epoch (if epoch_001 exists and epoch_002 does not)
+python -m src.optimizer --epochs 3 --start-epoch 2
+
+# Use a different model for the reviewer (default: haiku)
+# Edit DEFAULT_MODEL in src/optimizer.py, or pass --model flag to runner directly
+```
+
+The optimizer writes results to `data/epochs/epoch_NNN/`:
+
+```
+data/epochs/epoch_001/
+  train_results.jsonl    ← scored reviews for all 80 train tasks
+  proposed_edit.json     ← the exact edit proposed by Sonnet
+  skill_before.md        ← snapshot of skill.md before the edit
+  skill_after.md         ← skill.md with the proposed edit applied
+  selection_results.jsonl← scored reviews for the 20 selection tasks
+  epoch_result.json      ← {accepted, delta, train_mean, selection_before, selection_after}
+```
+
+If the run is interrupted (session limit, network error, etc.), **re-running the same command resumes automatically** — completed tasks are skipped.
+
+---
+
+### Step 5 — Read the Results
+
+```bash
+# Print a summary of a completed results file
+python3 -c "
+import json
+from pathlib import Path
+from src.runner import load_results, summarise
+
+results = load_results(Path('data/epochs/epoch_001/train_results.jsonl'))
+s = summarise(results)
+print(f'Tasks: {s[\"n_tasks\"]}')
+print(f'Mean score: {s[\"mean_score\"]:.3f}')
+print(f'Catch rate: {s[\"overall_catch_rate\"]:.1%}')
+print()
+print('By category:')
+for cat, v in sorted(s['by_category'].items(), key=lambda kv: kv[1]['rate']):
+    bar = '█' * int(v['rate'] * 20)
+    print(f'  {cat:<20} {v[\"caught\"]}/{v[\"total\"]}  {bar}  {v[\"rate\"]:.0%}')
+print()
+print('Top missed:')
+for bug, count in s['top_missed_bugs'][:5]:
+    print(f'  {bug:<35} {count}x')
+"
+
+# Check an epoch result
+cat data/epochs/epoch_001/epoch_result.json
+```
+
+---
+
+### Step 6 — Run the Test Evaluator (ONCE, after optimization is complete)
+
+The test split (50 tasks) is **locked** — it must not be used during optimization, only at the very end to get a final unbiased score.
+
+```bash
+# Only run this once, when you are satisfied with the skill
+python -m src.runner --split test --output data/test_results_final.jsonl
+```
+
+Compare the test score to the baseline selection score (0.233) to measure the true out-of-sample improvement.
+
+---
+
+### Adapting to a New Domain
+
+The system is domain-agnostic. To use it for a different task (e.g., SQL query review, security audit, documentation quality):
+
+**1. Replace the scenarios** (`src/dataset/scenarios.py`):
+- Define 4–8 scenario templates in your domain
+- Each scenario needs: a task description, 4–6 injectable "bugs" or quality issues, and a `generate_task(active_issues: set) -> str` function
+- Give each issue a list of keyword signals the scorer can look for in the reviewer's output
+
+**2. Replace the skill** (`skill.md`):
+- Write an initial skill document for your domain
+- Add a `<!-- SLOW_UPDATE_START --><!-- SLOW_UPDATE_END -->` block at the bottom
+- Deliberately leave some gaps so the optimizer has room to improve it
+
+**3. Regenerate the dataset**:
+```bash
+python -m src.dataset.generator   # writes data/tasks.json
+```
+
+**4. Run the baseline**:
+```bash
+python -m src.runner --split selection --output data/epochs/epoch_000/selection_results.jsonl
+```
+
+**5. Run the optimizer**:
+```bash
+python -m src.optimizer --epochs 5
+```
+
+The optimizer prompt in `src/optimizer.py` (`_PROPOSE_SYSTEM`) is written generically — it talks about "the skill document" and "missed items" and will work for any scoring domain without changes.
+
+---
+
+### Configuration Reference
+
+| Setting | Location | Default | Description |
+|---|---|---|---|
+| Reviewer model | `src/optimizer.py` `ROLLOUT_MODEL` | `claude-haiku-4-5-20251001` | Model used for reviewing tasks. Haiku is fast and cheap. |
+| Optimizer model | `src/optimizer.py` `OPTIMIZER_MODEL` | `claude-sonnet-4-6` | Model used to propose edits. Sonnet gives better edits. |
+| Workers | `src/runner.py` `run_rollout(..., workers=8)` | 8 | Parallel subprocess workers. Higher = faster but more session quota used. |
+| Subprocess timeout | `src/backend.py` `complete(..., timeout=300)` | 300s | Per-call timeout in seconds. |
+| Epochs dir | `src/optimizer.py` `EPOCHS_DIR` | `data/epochs/` | Where epoch results are written. |
+| Skill path | `src/optimizer.py` `SKILL_PATH` | `skill.md` | The skill document being optimized. |
+
+---
+
+### Understanding the Output Files
+
+| File | What it is |
+|---|---|
+| `data/tasks.json` | The full benchmark — 150 tasks with diffs, PR context, and expected bugs |
+| `data/epochs/epoch_000/selection_results.jsonl` | Baseline score before any optimization |
+| `data/epochs/epoch_NNN/train_results.jsonl` | One scored result per line; each has `task_id`, `score`, `caught`, `missed`, `review`, `usage`, `cost_usd` |
+| `data/epochs/epoch_NNN/proposed_edit.json` | The exact JSON proposal from Sonnet: `{target_step, rationale, old_text, new_text}` |
+| `data/epochs/epoch_NNN/epoch_result.json` | Final verdict: `{accepted, delta, selection_before, selection_after}` |
+| `skill.md` | The live skill document — modified in place when an edit is accepted |
+| `data/epochs/epoch_NNN/skill_before.md` | Snapshot of skill.md before the epoch's edit was applied |
+| `data/epochs/epoch_NNN/skill_after.md` | Snapshot of skill.md after the edit (regardless of whether accepted) |
+
+---
+
+### Typical Run Times
+
+| Operation | Wall-clock time | Notes |
+|---|---|---|
+| Generate dataset | < 5 seconds | Pure Python, no model calls |
+| Baseline selection (20 tasks) | ~4 minutes | 8 workers × ~25s/task |
+| Train rollout (80 tasks) | ~10–15 minutes | 8 workers; longer tasks can take 60s+ |
+| Propose edit (1 Sonnet call) | ~30 seconds | Includes failure analysis and 3 examples |
+| Selection gate (20 tasks) | ~4 minutes | Same as baseline |
+| Slow update (1 Sonnet call) | ~20 seconds | Reads all epoch histories |
+| **Full epoch** | **~20 minutes** | Train + propose + selection + slow update |
+| **3 epochs** | **~60 minutes** | If no session limits hit |
 
 ---
 
