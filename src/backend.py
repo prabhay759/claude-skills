@@ -79,10 +79,11 @@ def complete(
     # result field holds the text response otherwise
     text = envelope.get("result", "")
 
-    # session / rate limits surface as plain text in the result field, not as
-    # an error exit code — detect and raise so callers don't silently score 0.00
-    _LIMIT_PHRASES = ("session limit", "rate limit", "resets at", "resets ")
-    if any(p in text.lower() for p in _LIMIT_PHRASES):
+    # session limits surface as plain text, not as an error exit code — detect
+    # and raise so callers don't silently score 0.00. Use the exact phrase from
+    # the CLI message to avoid false positives on reviews that discuss things
+    # like "rate limiting middleware" or "cache resets".
+    if "hit your session limit" in text.lower():
         raise RuntimeError(f"Claude session limit: {text.strip()[:120]}")
 
     # stop-hook injection: the hook responds as a conversational assistant instead
