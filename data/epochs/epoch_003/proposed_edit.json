@@ -1,0 +1,7 @@
+{
+  "epoch": 3,
+  "target_step": "Step 3",
+  "rationale": "The agent already knows bare-ID keys are a problem but consistently misses collisions because it reviews the cache helper in isolation \u2014 adding an explicit instruction to scan every call site and read the literal key argument forces it to catch the bug where it actually lives.",
+  "old_text": "  - **Cache key collisions**: keys that are bare IDs with no entity-type prefix \u2014 e.g. `cacheGet('42')` used for both users and products hits the same slot; keys must encode the entity type (`user:42`, `product:42`)",
+  "new_text": "  - **Cache key collisions**: keys that are bare IDs with no entity-type prefix \u2014 e.g. `cacheGet('42')` used for both users and products hits the same slot; keys must encode the entity type (`user:42`, `product:42`)\n    - **Scan every call site, not just the helper**: for each invocation of `cacheGet`/`cacheSet`/`getOrSet` (or any equivalent), read the literal key argument \u2014 if you see `cacheGet(userId)`, `cacheGet(String(id))`, `` cacheGet(`${id}`) ``, or any bare numeric/string ID without a type prefix string, flag it as a collision risk even when the cache helper itself looks correct\n    - **Multi-tenant check**: if `tenantId` or `orgId` exists in the surrounding scope but the cache key omits it, entries collide across tenants \u2014 verify every dimension that makes the resource unique is present in the key"
+}

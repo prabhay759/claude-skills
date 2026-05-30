@@ -1,0 +1,7 @@
+{
+  "epoch": 1,
+  "target_step": "Step 3",
+  "rationale": "The `logic` category has the lowest catch rate (71%), and `key_collision` is missed 8\u00d7 \u2014 the agent never checks whether cache keys are namespaced, so it misses collisions when bare IDs are shared across entity types; adding concrete sub-bullets for this pattern (and the related `wrong_expiry`/`stampede` misses) directly teaches the check.",
+  "old_text": "- **Logic**: wrong conditions, off-by-one errors, missing state updates",
+  "new_text": "- **Logic**: wrong conditions, off-by-one errors, missing state updates\n  - **Cache key collisions**: keys that are bare IDs with no entity-type prefix \u2014 e.g. `cacheGet('42')` used for both users and products hits the same slot; keys must encode the entity type (`user:42`, `product:42`)\n  - **Unused TTL / wrong expiry**: a `ttlSeconds` (or similar) parameter accepted by the function but never forwarded to the underlying store call (e.g. `SET key value` with no `EX` argument), so entries never expire\n  - **Cache stampede**: on a cache miss, multiple concurrent callers all recompute and overwrite \u2014 look for a missing lock/mutex guard around the miss-fill path"
+}

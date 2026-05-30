@@ -1,0 +1,15 @@
+{
+  "epoch": 5,
+  "train_mean": 0.9083,
+  "selection_before": 0.9583,
+  "selection_after": 0.9417,
+  "delta": -0.01660000000000006,
+  "accepted": false,
+  "proposal": {
+    "epoch": 5,
+    "target_step": "Step 3",
+    "rationale": "The agent misses key_collision 6\u00d7 because all failing scenarios involve a PR that *defines* the cache helper \u2014 when no call sites are in the diff, the agent checks the implementation (which looks correct) and moves on, never flagging that the `key: string` API itself enables bare-ID collisions from any future caller; adding an explicit \"helper definition\" sub-bullet forces the agent to evaluate the API contract, not just call sites.",
+    "old_text": "  - **Cache key collisions**: keys that are bare IDs with no entity-type prefix \u2014 e.g. `cacheGet('42')` used for both users and products hits the same slot; keys must encode the entity type (`user:42`, `product:42`)\n    - **Scan every call site, not just the helper**: for each invocation of `cacheGet`/`cacheSet`/`getOrSet` (or any equivalent), read the literal key argument \u2014 if you see `cacheGet(userId)`, `cacheGet(String(id))`, `` cacheGet(`${id}`) ``, or any bare numeric/string ID without a type prefix string, flag it as a collision risk even when the cache helper itself looks correct\n    - **Multi-tenant check**: if `tenantId` or `orgId` exists in the surrounding scope but the cache key omits it, entries collide across tenants \u2014 verify every dimension that makes the resource unique is present in the key",
+    "new_text": "  - **Cache key collisions**: keys that are bare IDs with no entity-type prefix \u2014 e.g. `cacheGet('42')` used for both users and products hits the same slot; keys must encode the entity type (`user:42`, `product:42`)\n    - **Scan every call site, not just the helper**: for each invocation of `cacheGet`/`cacheSet`/`getOrSet` (or any equivalent), read the literal key argument \u2014 if you see `cacheGet(userId)`, `cacheGet(String(id))`, `` cacheGet(`${id}`) ``, or any bare numeric/string ID without a type prefix string, flag it as a collision risk even when the cache helper itself looks correct\n    - **Multi-tenant check**: if `tenantId` or `orgId` exists in the surrounding scope but the cache key omits it, entries collide across tenants \u2014 verify every dimension that makes the resource unique is present in the key\n    - **Helper API design (when the PR defines the helper, not a call site)**: if the new helper accepts `key: string` with no namespace enforcement \u2014 no `key.includes(':')` assertion, no branded `CacheKey` type, no runtime prefix validation \u2014 flag the API design itself as a key_collision risk; a caller passing `cacheGet(userId)` or `cacheGet('42')` will silently collide with any other entity type that uses the same numeric ID, and no call site needs to be in the diff to identify this \u2014 the absence of a namespace contract in the function signature is the bug"
+  }
+}
