@@ -692,37 +692,58 @@ After the gate (always, regardless of accept/reject), the optimizer rewrote the 
 
 ## 11. Results Across All Epochs
 
-### Selection Score Progression
+### Final Test Score
 
-| Epoch | Selection Score | Delta | Decision | Key Change |
-|---|---|---|---|---|
-| Baseline | **0.233** | — | — | Initial skill.md |
-| Epoch 1 | **0.951** | **+71.8%** | ACCEPTED ✓ | Cache key collision, unused TTL, stampede sub-bullets added |
-| Epoch 2 | 0.926 | −2.5% | REJECTED ✗ | Key-collision call-site scanning + cents/dollars bullet regressed; reverted |
-| Epoch 3 | in progress | — | — | Session limit mid-rollout; resumes when session resets |
+> **0.861 mean score — 86% bug catch rate on 49 unseen tasks**
 
-### Per-Category Catch Rates (Epoch 1 Train)
+The test split (50 tasks, never touched during optimization) was run once after all epochs completed. One task timed out; 49 scored.
+
+### Full Optimization Trajectory
+
+| Phase | Score | Delta | Notes |
+|---|---|---|---|
+| Baseline (selection, corrupted) | 0.233 | — | Stop-hook bug inflated misses |
+| **Epoch 1** (ACCEPTED) | **0.951** | **+71.8%** | Cache collision + TTL + stampede sub-bullets |
+| Epoch 2 (REJECTED) | 0.926 | −2.5% | Call-site scanning + cents/dollars; regressed |
+| **Epoch 3** (ACCEPTED) | **0.958** | **+0.7%** | "Scan every call site" + multi-tenant check |
+| Epoch 4 (REJECTED) | 0.942 | −1.7% | Cross-entity collision scan; regressed |
+| Epoch 5 (REJECTED) | 0.942 | −1.7% | Helper API contract check; regressed |
+| **Test split (final)** | **0.861** | — | 50 unseen tasks; unbiased final score |
+
+### Final Test Split — Per-Category Catch Rates (49 unseen tasks)
 
 | Category | Caught / Total | Rate |
 |---|---|---|
-| security | 23 / 23 | **100%** |
-| null_safety | 18 / 18 | **100%** |
-| performance | 18 / 18 | **100%** |
-| type_safety | 13 / 13 | **100%** |
-| error_handling | 24 / 26 | **92%** |
-| **logic** | **32 / 45** | **71%** ← target for optimization |
+| performance | 9 / 9 | **100%** |
+| security | 30 / 31 | **97%** |
+| error_handling | 19 / 23 | **83%** |
+| type_safety | 5 / 6 | **83%** |
+| null_safety | 9 / 11 | **82%** |
+| **logic** | **18 / 25** | **72%** ← persistent weak spot |
+
+### What the Optimizer Learned to Catch
+
+The `logic` category started at 71% catch rate (epoch 1 train baseline) and ended at 72% on the final test. The optimizer correctly identified it as the weak spot and made three targeted edits — all accepted or informing the slow update — but the ceiling of what keyword-scored data can push through the strict selection gate was reached.
+
+Most stubborn misses on the test split:
+
+| Bug | Misses | Root cause |
+|---|---|---|
+| `wrong_expiry` | 3× | TTL unit confusion (seconds vs ms) — correct value, wrong scale |
+| `cents_vs_dollars` | 2× | Money denomination mismatch — requires understanding API contracts |
+| `swallow_error` | 2× | Silent catch blocks — reviewer finds some but not all |
+| `json_parse_no_catch` | 2× | Missing try/catch around JSON.parse — easy to overlook |
 
 ### Cost and Token Usage (All Runs Combined)
 
 | Metric | Value |
 |---|---|
-| Total model calls | 235 |
-| Direct input tokens | 5,722 |
-| Output tokens | 827,593 |
-| **Cache reads** | **8,448,760 tokens** |
-| **Total cost** | **$7.94** |
+| Total model calls (all epochs + test) | ~400 |
+| **Cache reads** | **>11M tokens** |
+| Test split cost | $2.31 |
+| **Estimated total project cost** | **~$10** |
 
-The extremely low direct input token count (5,722) versus cache reads (8.4 million) shows the prompt cache working as intended. The system prompt (skill.md, ~1,500 chars) is cached after the first call in each run and served from cache on every subsequent task — reducing cost by roughly 90% compared to sending the full system prompt fresh each time.
+The prompt cache is the dominant cost reduction mechanism. The skill.md system prompt (~2,000 chars after optimization) is cached after the first call in each batch and served from cache on the remaining tasks — reducing token cost by ~90% versus sending the full prompt fresh each time.
 
 ---
 
